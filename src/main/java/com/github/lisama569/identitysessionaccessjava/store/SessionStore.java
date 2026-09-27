@@ -1,6 +1,7 @@
 package com.github.lisama569.identitysessionaccessjava.store;
 
 import com.github.lisama569.identitysessionaccessjava.model.CredentialRecord;
+import com.github.lisama569.identitysessionaccessjava.model.RevokeKind;
 import com.github.lisama569.identitysessionaccessjava.model.SessionInfo;
 
 import java.util.List;
@@ -20,6 +21,20 @@ public interface SessionStore {
 
     /** 登录建会话：会话与其首张凭证一起入库。 */
     void create(SessionInfo session, CredentialRecord credential);
+
+    /**
+     * 登录建会话并原子执行账号容量淘汰。整个“建会话 + 超限淘汰”在账号级锁内
+     * 一次完成：并发登录收敛后，该账号活跃会话数不超过 maxActiveSessions。
+     * 淘汰规则：按 lastActiveAt 升序，最久未活跃者先出局；新会话活跃时间最新，
+     * 不会淘汰自己。被淘汰会话在锁内标记撤销（类别 CAPACITY）并连带凭证失效。
+     *
+     * @return 本次被淘汰的会话（可能为空）
+     */
+    List<SessionInfo> atomicCreateSession(SessionInfo session, CredentialRecord credential,
+                                          int maxActiveSessions, long nowMillis);
+
+    /** 列出账号名下全部会话（含已结束），调用方自行过滤活跃会话。 */
+    List<SessionInfo> sessionsOfAccount(String userId);
 
     Optional<SessionInfo> findSession(String sessionId);
 
@@ -45,10 +60,22 @@ public interface SessionStore {
     /**
      * 原子刷新轮换。调用方先通过 {@link #beginRefreshAttempt} 登记批次；
      * 身份/状态/当前指针的全部权威判定都在会话锁内完成，结果由 {@link RefreshOutcome} 表达。
+     * 兼容重载：不做空闲判定（等价于空闲上限无限大）。
+     */
+    default RefreshOutcome atomicRefresh(String batchHandle, String requestId,
+                                         String presentedCredentialId, CredentialRecord newCredential,
+                                         long nowMillis) {
+        return atomicRefresh(batchHandle, requestId, presentedCredentialId, newCredential,
+                nowMillis, Long.MAX_VALUE);
+    }
+
+    /**
+     * 原子刷新轮换（含空闲判定）。撤销 &gt; 绝对过期 &gt; 空闲超时 &gt; 轮换/并发
+     * 的优先级在会话锁内权威判定；成功时在锁内将会话 lastActiveAt 顺延到 now。
      */
     RefreshOutcome atomicRefresh(String batchHandle, String requestId,
                                  String presentedCredentialId, CredentialRecord newCredential,
-                                 long nowMillis);
+                                 long nowMillis, long idleTimeoutMillis);
 
     /** 刷新尝试结束（无论成功失败），释放批次占位。 */
     void endRefreshAttempt(String batchHandle, String requestId);
@@ -58,7 +85,18 @@ public interface SessionStore {
      *
      * @return 被连带撤销（状态发生迁移）的凭证；会话不存在返回 null
      */
-    List<CredentialRecord> atomicRevokeSession(String sessionId, String reason, long nowMillis);
+    default List<CredentialRecord> atomicRevokeSession(String sessionId, String reason, long nowMillis) {
+        return atomicRevokeSession(sessionId, reason, RevokeKind.EXPLICIT, nowMillis);
+    }
+
+    /**
+     * 原子结束会话（带结束类别）：锁内标记会话 REVOKED 并记录 {@link RevokeKind}，
+     * 把名下所有非撤销凭证置为 REVOKED。重复结束保留首次类别与原因。
+     *
+     * @return 被连带撤销（状态发生迁移）的凭证；会话不存在返回 null
+     */
+    List<CredentialRecord> atomicRevokeSession(String sessionId, String reason, RevokeKind kind,
+                                               long nowMillis);
 
     /** 撤销单张凭证（凭证级撤销）；凭证不存在返回 false。 */
     boolean atomicRevokeCredential(String credentialId, String reason, long nowMillis);
@@ -84,7 +122,9 @@ public interface SessionStore {
              */
             SUPERSEDED_REPLAY,
             /** 进入锁时凭证已过期（边界 now &gt;= expiresAt）。 */
-            EXPIRED
+            EXPIRED,
+            /** 进入锁时会话空闲超时（now - lastActiveAt &gt;= idleTimeoutMillis）。 */
+            IDLE_EXPIRED
         }
 
         private final Kind kind;

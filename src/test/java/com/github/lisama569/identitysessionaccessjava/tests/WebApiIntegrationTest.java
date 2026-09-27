@@ -139,4 +139,43 @@ class WebApiIntegrationTest {
                 .andExpect(status().isUnauthorized())
                 .andExpect(jsonPath("$.reason").value("USER_DISABLED"));
     }
+
+    @Test
+    void accountSessionGovernanceEndToEnd() throws Exception {
+        // 同一账号两个设备登录（用 bob，避免与本类其他用例的 alice 会话互相计入容量）
+        JsonNode device1 = login("bob", "bob-pass");
+        JsonNode device2 = login("bob", "bob-pass");
+        String token1 = device1.get("token").asText();
+        String token2 = device2.get("token").asText();
+        String session1 = device1.get("sessionId").asText();
+        String session2 = device2.get("sessionId").asText();
+
+        // 按账号查看活跃会话：两个会话都在，含签发时间/最近活跃时间/凭证代次
+        mvc.perform(get("/api/auth/accounts/bob/sessions"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.activeSessionCount").value(2))
+                .andExpect(jsonPath("$.sessions[?(@.sessionId=='" + session1 + "')].issuedAt").exists())
+                .andExpect(jsonPath("$.sessions[?(@.sessionId=='" + session1 + "')].lastActiveAt").exists())
+                .andExpect(jsonPath("$.sessions[?(@.sessionId=='" + session1 + "')].currentVersion").exists());
+        log.info("治理视图端到端：账号 bob 活跃会话=2, session1={} session2={}", session1, session2);
+
+        // 定向结束设备 1：其凭证立即失效（401 SESSION_REVOKED），设备 2 照常可用
+        mvc.perform(post("/api/auth/sessions/" + session1 + "/revoke")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"reason\":\"kick-one-device\"}"))
+                .andExpect(status().isOk());
+        mvc.perform(get("/api/resources/profile").header("Authorization", "Bearer " + token1))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.reason").value("SESSION_REVOKED"));
+        mvc.perform(get("/api/resources/profile").header("Authorization", "Bearer " + token2))
+                .andExpect(status().isOk());
+        log.info("定向结束端到端：session1={} 访问->401 SESSION_REVOKED, session2={} 仍可用",
+                session1, session2);
+
+        // 治理视图收敛为 1 个活跃会话
+        mvc.perform(get("/api/auth/accounts/bob/sessions"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.activeSessionCount").value(1))
+                .andExpect(jsonPath("$.sessions[0].sessionId").value(session2));
+    }
 }

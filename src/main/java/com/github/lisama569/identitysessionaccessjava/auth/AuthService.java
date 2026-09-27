@@ -2,7 +2,10 @@ package com.github.lisama569.identitysessionaccessjava.auth;
 
 import com.github.lisama569.identitysessionaccessjava.model.CredentialRecord;
 import com.github.lisama569.identitysessionaccessjava.model.SessionInfo;
+import com.github.lisama569.identitysessionaccessjava.model.SessionView;
 import com.github.lisama569.identitysessionaccessjava.web.dto.TokenResponse;
+
+import java.util.List;
 
 /**
  * 登录、刷新（轮换）、撤销。
@@ -25,6 +28,12 @@ public interface AuthService {
 
     void revokeSession(String sessionId, String reason);
     void revokeCredential(String credentialId, String reason);
+
+    /**
+     * 列出账号名下当前活跃会话（未撤销、未绝对过期、未空闲超时）。
+     * 每个视图包含签发时间、最近活跃时间与当前凭证代次。
+     */
+    List<SessionView> listActiveSessions(String username);
     /** 仅供解析展示/内部使用。 */
     SessionInfo requireSession(String sessionId);
     CredentialRecord requireCredential(String credentialId);
