@@ -41,8 +41,15 @@ public class DefaultAuthService implements AuthService {
 
     /** 账号级活跃会话上限默认值。 */
     public static final int DEFAULT_MAX_ACTIVE_SESSIONS = 5;
-    /** 会话空闲超时默认值（30 分钟）。 */
-    public static final long DEFAULT_IDLE_TIMEOUT_MILLIS = 1_800_000L;
+    /**
+     * 会话空闲超时默认值（10 分钟）。
+     *
+     * <p>必须小于默认凭证 TTL（15 分钟）：否则“完全无活动”的会话会先撞上绝对有效期，
+     * 空闲判定在默认启动方式下永远不可达（只能看到 CREDENTIAL_EXPIRED）。
+     * 默认取 10 分钟后，无活动会话在第 10 分钟即被 SESSION_IDLE_EXPIRED 拒绝，
+     * 而持续活跃的会话可一直用到第 15 分钟的绝对过期，两个原因默认可稳定区分。</p>
+     */
+    public static final long DEFAULT_IDLE_TIMEOUT_MILLIS = 600_000L;
 
     private final UserStore userStore;
     private final SessionStore sessionStore;
@@ -59,7 +66,7 @@ public class DefaultAuthService implements AuthService {
                               PasswordHasher passwordHasher, AuditService audit, TimeSource timeSource,
                               @Value("${identity.session.ttl-millis:900000}") long ttlMillis,
                               @Value("${identity.session.max-active-sessions-per-account:5}") int maxActiveSessions,
-                              @Value("${identity.session.idle-timeout-millis:1800000}") long idleTimeoutMillis) {
+                              @Value("${identity.session.idle-timeout-millis:600000}") long idleTimeoutMillis) {
         this.userStore = userStore;
         this.sessionStore = sessionStore;
         this.tokenService = tokenService;
@@ -69,6 +76,30 @@ public class DefaultAuthService implements AuthService {
         this.ttlMillis = ttlMillis;
         this.maxActiveSessions = maxActiveSessions;
         this.idleTimeoutMillis = idleTimeoutMillis;
+        if (ttlMillis <= 0 || idleTimeoutMillis <= 0) {
+            throw new IllegalArgumentException("凭证 TTL 与空闲窗口都必须为正数：ttl="
+                    + ttlMillis + ", idle=" + idleTimeoutMillis);
+        }
+    }
+
+    /**
+     * 校验“默认入口”配置自洽性：空闲窗口必须严格短于凭证绝对有效期，
+     * 否则完全无活动的会话会先撞上绝对过期，{@code SESSION_IDLE_EXPIRED} 在该配置下
+     * 永远不可达（本仓库默认配置曾出现过的缺陷：TTL=15min 而 idle=30min）。
+     *
+     * <p>放在独立方法而不是构造器里，是因为服务层直连/测试常会传短 TTL 配合显式
+     * 空闲窗口做精确时钟测试；该校验只约束 Spring 默认装配的配置组合。</p>
+     */
+    @jakarta.annotation.PostConstruct
+    public void validateIdleWindowShorterThanTtl() {
+        if (idleTimeoutMillis >= ttlMillis) {
+            throw new IllegalStateException(
+                    "空闲窗口必须严格短于凭证绝对有效期，否则 SESSION_IDLE_EXPIRED 永远不可达："
+                            + "identity.session.idle-timeout-millis=" + idleTimeoutMillis
+                            + " >= identity.session.ttl-millis=" + ttlMillis
+                            + "。请调小 idle-timeout-millis（默认 600000=10 分钟）"
+                            + "或调大 ttl-millis（默认 900000=15 分钟）");
+        }
     }
 
     /** 兼容构造：使用默认容量上限与默认空闲超时。 */

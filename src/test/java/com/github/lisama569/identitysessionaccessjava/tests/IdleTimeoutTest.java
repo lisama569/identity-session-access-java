@@ -9,6 +9,7 @@ import com.github.lisama569.identitysessionaccessjava.auth.DefaultAuthService;
 import com.github.lisama569.identitysessionaccessjava.auth.PasswordHasher;
 import com.github.lisama569.identitysessionaccessjava.model.AuthDecision;
 import com.github.lisama569.identitysessionaccessjava.model.DenyReason;
+import com.github.lisama569.identitysessionaccessjava.model.SessionView;
 import com.github.lisama569.identitysessionaccessjava.model.UserAccount;
 import com.github.lisama569.identitysessionaccessjava.store.InMemoryAuditStore;
 import com.github.lisama569.identitysessionaccessjava.store.InMemorySessionStore;
@@ -21,6 +22,7 @@ import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -42,12 +44,13 @@ class IdleTimeoutTest {
     private MutableTimeSource clock;
     private DefaultAuthService auth;
     private DefaultAccessControlService access;
+    private InMemorySessionStore sessionStore;
 
     @BeforeEach
     void setUp() {
         clock = new MutableTimeSource(1_000_000L);
         InMemoryUserStore users = new InMemoryUserStore();
-        InMemorySessionStore sessionStore = new InMemorySessionStore();
+        sessionStore = new InMemorySessionStore();
         PasswordHasher hasher = new PasswordHasher();
         users.save(new UserAccount("u-1", "alice", hasher.hash("pw", "salt"), "salt",
                 Set.of("USER"), Map.of(), true));
@@ -169,6 +172,94 @@ class IdleTimeoutTest {
         AuthenticationException ex3 = assertThrows(AuthenticationException.class,
                 () -> auth.refresh(t2b.token()));
         assertEquals(DenyReason.SESSION_IDLE_EXPIRED, ex3.getReason());
+    }
+
+    @Test
+    void idleBoundaryEqualityIsExactOnBothEntries() {
+        TokenResponse t = auth.login("alice", "pw");
+
+        // 恰在空闲边界（now - lastActiveAt == idleTimeout，含相等）：访问入口立即超时
+        clock.advance(IDLE);
+        AuthDecision atBoundary = access.decide(t.token(), "profile:read", "profile");
+        assertEquals(DenyReason.SESSION_IDLE_EXPIRED, atBoundary.getReason());
+        log.info("空闲边界相等 credential={} 判定依据=now-lastActiveAt==idleTimeout 含等于, "
+                + "访问 SESSION_IDLE_EXPIRED", t.credentialId());
+
+        // 刷新入口在同一边界给出一致结论
+        AuthenticationException ex = assertThrows(AuthenticationException.class,
+                () -> auth.refresh(t.token()));
+        assertEquals(DenyReason.SESSION_IDLE_EXPIRED, ex.getReason());
+        log.info("空闲边界相等 credential={} 刷新入口结论一致=SESSION_IDLE_EXPIRED",
+                t.credentialId());
+    }
+
+    @Test
+    void idleExpiryIsSessionLevelAndOtherSessionsUnaffected() {
+        // 同一账号两台设备
+        TokenResponse deviceA = auth.login("alice", "pw");
+        clock.advance(100);
+        TokenResponse deviceB = auth.login("alice", "pw");
+
+        // 设备 A 先轮换一次，拿到已轮换旧凭证与当前凭证两张
+        clock.advance(100);
+        TokenResponse deviceA2 = auth.refresh(deviceA.token());
+
+        // 此后设备 A 长期无活动；设备 B 先在自己的空闲窗口内访问一次（顺延）
+        clock.advance(IDLE - 200);
+        assertTrue(access.decide(deviceB.token(), "profile:read", "profile").isAllowed());
+        // 再推进到“距 B 最后一次活动还差 1ms”：A 自刷新后已空闲超时，B 仍然新鲜
+        clock.advance(IDLE - 1);
+
+        // 空闲是会话级判定：A 的旧凭证与当前凭证、访问与刷新，全部 SESSION_IDLE_EXPIRED
+        assertEquals(DenyReason.SESSION_IDLE_EXPIRED,
+                access.decide(deviceA.token(), "profile:read", "profile").getReason());
+        assertEquals(DenyReason.SESSION_IDLE_EXPIRED,
+                access.decide(deviceA2.token(), "profile:read", "profile").getReason());
+        assertEquals(DenyReason.SESSION_IDLE_EXPIRED, assertThrows(AuthenticationException.class,
+                () -> auth.refresh(deviceA.token())).getReason());
+        assertEquals(DenyReason.SESSION_IDLE_EXPIRED, assertThrows(AuthenticationException.class,
+                () -> auth.refresh(deviceA2.token())).getReason());
+        log.info("空闲会话级生效 sessionA={} old/new 凭证访问与刷新均 SESSION_IDLE_EXPIRED",
+                deviceA.sessionId());
+
+        // 同一账号的另一个会话互不影响：B 仍在自己的空闲窗口内，照常可用
+        assertTrue(access.decide(deviceB.token(), "profile:read", "profile").isAllowed());
+        TokenResponse deviceB2 = auth.refresh(deviceB.token());
+        assertTrue(access.decide(deviceB2.token(), "profile:read", "profile").isAllowed());
+        log.info("同账号会话隔离：A 空闲不影响 sessionB={} 访问与刷新", deviceB.sessionId());
+
+        // 已空闲的 A 用旧凭证/当前凭证反复重试都无法复活，也不会重新出现在活跃列表
+        assertEquals(DenyReason.SESSION_IDLE_EXPIRED,
+                access.decide(deviceA2.token(), "profile:read", "profile").getReason());
+        assertEquals(DenyReason.SESSION_IDLE_EXPIRED, assertThrows(AuthenticationException.class,
+                () -> auth.refresh(deviceA2.token())).getReason());
+        List<SessionView> views = auth.listActiveSessions("alice");
+        assertTrue(views.stream().noneMatch(v -> v.sessionId().equals(deviceA.sessionId())));
+        assertTrue(views.stream().anyMatch(v -> v.sessionId().equals(deviceB.sessionId())));
+    }
+
+    @Test
+    void capacityEvictionBeatsIdleOnBothEntries() {
+        TokenResponse t = auth.login("alice", "pw");
+        // 会话先满足空闲超时
+        clock.advance(IDLE * 2);
+        assertEquals(DenyReason.SESSION_IDLE_EXPIRED,
+                access.decide(t.token(), "profile:read", "profile").getReason());
+
+        // 随后该会话又因容量被结束（模拟并发登录淘汰叠加在空闲会话上）
+        sessionStore.atomicRevokeSession(t.sessionId(),
+                "capacity-evict: 叠加空闲会话",
+                com.github.lisama569.identitysessionaccessjava.model.RevokeKind.CAPACITY,
+                clock.nowMillis());
+
+        // 撤销类（容量淘汰）优先于空闲：访问与刷新都稳定报 SESSION_CAPACITY_EVICTED
+        AuthDecision d = access.decide(t.token(), "profile:read", "profile");
+        assertEquals(DenyReason.SESSION_CAPACITY_EVICTED, d.getReason());
+        AuthenticationException ex = assertThrows(AuthenticationException.class,
+                () -> auth.refresh(t.token()));
+        assertEquals(DenyReason.SESSION_CAPACITY_EVICTED, ex.getReason());
+        log.info("容量淘汰+空闲叠加 credential={} 判定依据=撤销类优先于空闲 -> "
+                + "SESSION_CAPACITY_EVICTED（访问/刷新一致）", t.credentialId());
     }
 
     @Test

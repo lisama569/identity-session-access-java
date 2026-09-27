@@ -38,7 +38,8 @@ class SessionGovernanceTest {
 
     private static final Logger log = LoggerFactory.getLogger(SessionGovernanceTest.class);
     private static final long TTL = 60_000L;
-    private static final long IDLE = 300_000L;
+    // 空闲窗口短于 TTL（启动校验要求）；治理用例的时间推进都远小于它，不误触空闲判定
+    private static final long IDLE = 30_000L;
     private static final int MAX_SESSIONS = 5;
 
     private MutableTimeSource clock;

@@ -46,7 +46,9 @@ class SessionCapacityTest {
 
     private static final Logger log = LoggerFactory.getLogger(SessionCapacityTest.class);
     private static final long TTL = 60_000L;
-    private static final long IDLE = 300_000L;
+    // 空闲窗口短于 TTL（启动校验要求），且大于本类测试中推进的最大时间跨度，
+    // 因此容量相关用例不会误触空闲判定。
+    private static final long IDLE = 30_000L;
     private static final int MAX_SESSIONS = 3;
 
     private MutableTimeSource clock;
@@ -132,9 +134,15 @@ class SessionCapacityTest {
         auth.revokeSession(s5.sessionId(), "user-logout");
         assertEquals(DenyReason.SESSION_REVOKED,
                 access.decide(s5.token(), "profile:read", "profile").getReason());
-        // 自然过期
+        // 自然过期：保持活跃（访问顺延空闲窗口）直到凭证绝对有效期
         TokenResponse s6 = auth.login("alice", "pw");
-        clock.advance(TTL);
+        long elapsed = 0;
+        while (elapsed + (IDLE - 1_000) < TTL) {
+            clock.advance(IDLE - 1_000);
+            elapsed += IDLE - 1_000;
+            assertTrue(access.decide(s6.token(), "profile:read", "profile").isAllowed());
+        }
+        clock.advance(TTL - elapsed);
         assertEquals(DenyReason.CREDENTIAL_EXPIRED,
                 access.decide(s6.token(), "profile:read", "profile").getReason());
         // 未认证

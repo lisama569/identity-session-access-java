@@ -58,7 +58,7 @@ public class DefaultAccessControlService implements AccessControlService {
     public DefaultAccessControlService(TokenService tokenService, SessionStore sessionStore,
                                        UserStore userStore, PolicyRegistry policyRegistry,
                                        AuditService audit, TimeSource timeSource,
-                                       @Value("${identity.session.idle-timeout-millis:1800000}") long idleTimeoutMillis) {
+                                       @Value("${identity.session.idle-timeout-millis:600000}") long idleTimeoutMillis) {
         this.tokenService = tokenService;
         this.sessionStore = sessionStore;
         this.userStore = userStore;
@@ -68,12 +68,15 @@ public class DefaultAccessControlService implements AccessControlService {
         this.idleTimeoutMillis = idleTimeoutMillis;
     }
 
-    /** 兼容构造：使用默认空闲超时（30 分钟）。 */
+    /**
+     * 兼容构造：使用默认空闲超时（10 分钟，见
+     * {@link com.github.lisama569.identitysessionaccessjava.auth.DefaultAuthService#DEFAULT_IDLE_TIMEOUT_MILLIS}）。
+     */
     public DefaultAccessControlService(TokenService tokenService, SessionStore sessionStore,
                                        UserStore userStore, PolicyRegistry policyRegistry,
                                        AuditService audit, TimeSource timeSource) {
         this(tokenService, sessionStore, userStore, policyRegistry, audit, timeSource,
-                1_800_000L);
+                600_000L);
     }
 
     @Override
