@@ -62,14 +62,23 @@
 
 ### 1.0.2 会话空闲超时
 
-- 配置：`identity.session.idle-timeout-millis`，**默认 1800000（30 分钟）**。
+- 配置：`identity.session.idle-timeout-millis`，单位毫秒，**默认 600000（10 分钟）**。
+- 默认可达：默认空闲窗口（10 分钟）**严格短于**默认凭证有效期
+  `identity.session.ttl-millis`（**默认 900000 / 15 分钟**）。因此按仓库默认配置
+  直接启动、不做任何额外调整时，一个登录后长期不操作的会话会**先**到达空闲窗口、
+  **后**到达凭证绝对有效期——空闲超时在默认入口下稳定可见；若把空闲窗口配置为
+  ≥ 凭证 TTL，凭证将总是先绝对过期，空闲超时不可达，服务启动时会打印 WARN 提示。
 - 判定：在既有绝对有效期（`expiresAt`）之外，再检查
-  `now - lastActiveAt >= idleTimeoutMillis`（含边界）即视为空闲超时。
+  `now - lastActiveAt >= idleTimeoutMillis`（**含边界：恰好相等即超时**）即视为空闲超时。
 - 活动顺延：**刷新成功**与**受保护访问通过**都算一次活动，会把
   `lastActiveAt` 顺延到当前时刻（单调推进，并发安全）。
 - 效果：长时间没有任何活动的会话，即使远未到绝对有效期，下一次访问或刷新
   也会被拒绝，原因为 **`SESSION_IDLE_EXPIRED`**，与 `CREDENTIAL_EXPIRED`
-  （绝对过期）互相区分。空闲超时是会话级判定，对该会话当前与已轮换的凭证同样生效。
+  （绝对过期）、`UNAUTHENTICATED`（未认证）、`SESSION_REVOKED` /
+  `SESSION_CAPACITY_EVICTED`（撤销类）互相区分。空闲超时是会话级判定，
+  对该会话当前凭证与已轮换的旧凭证同样生效。
+- 不可复活：空闲超时是惰性判定的会话级终态——该会话从活跃会话治理列表消失，
+  重复访问/刷新、等待、旧凭证重放、已轮换凭证重放都不能使其恢复，只能重新登录。
 
 ### 1.0.3 拒绝原因优先级（稳定顺序）
 
@@ -229,7 +238,7 @@ ACCESS_ALLOWED / ACCESS_DENIED / SESSION_REVOKED / CREDENTIAL_REVOKED`
 ## 6. 验证方法
 
 ```bash
-# 全量测试（104 个用例，含并发重复压测）
+# 全量测试（113 个用例，含并发重复压测）
 mvn test
 
 # 仅并发刷新（16 线程 × 20 次重复 + 2 线程确定性用例）
@@ -244,8 +253,14 @@ mvn test -Dtest=SessionGovernanceTest
 # 会话容量（LRU 淘汰、原因可区分、并发登录与淘汰竞争收敛，含重复压测）
 mvn test -Dtest=SessionCapacityTest
 
-# 空闲超时（边界精确、刷新/访问顺延、与绝对过期及撤销的优先级）
+# 空闲超时（默认常量可达性、边界含相等、长期无活动访问/刷新、
+# 多设备隔离、撤销/容量叠加优先级、旧凭证不可复活、治理视图消失）
 mvn test -Dtest=IdleTimeoutTest
+
+# 空闲超时默认配置守护：默认 application.properties 下空闲窗口必须短于 TTL，
+# 两个入口装配同一窗口；真实 Spring 链路（真实时钟）下等待超过空闲窗口，
+# 访问与刷新都得到 SESSION_IDLE_EXPIRED
+mvn test -Dtest=IdleTimeoutDefaultPropertiesTest,IdleTimeoutWiredEntryTest
 
 # 过期边界 / 轮换重放 / 撤销后访问 / RBAC+ABAC / 降权即时生效
 mvn test -Dtest=AuthServiceTest,AccessControlServiceTest,AuditTrailTest
@@ -270,7 +285,7 @@ mvn test -Dtest=WebApiIntegrationTest
 | 按账号列出活跃会话（签发/活跃时间/代次）、定向结束互不影响、结束后不可复活 | `SessionGovernanceTest`、`WebApiIntegrationTest.accountSessionGovernanceEndToEnd` |
 | 容量上限、最久未活跃先出局、淘汰原因可区分 | `SessionCapacityTest.capacityEvictsLeastRecentlyActiveFirst`、`evictionReasonIsDistinctFromOtherDenyReasons` |
 | 并发登录/刷新与淘汰竞争收敛后不超上限、被淘汰凭证不可用 | `SessionCapacityTest.concurrentLoginsConvergeToCapacityLimit`（×10）、`refreshRacingEvictionNeverLeavesUsableEvictedCredential`（×10） |
-| 空闲超时边界、刷新/访问顺延、与绝对过期区分、撤销优先级稳定 | `IdleTimeoutTest` |
+| 空闲超时默认可达（无需额外配置）、边界含相等、访问/刷新顺延与双入口一致、与绝对过期区分、撤销/容量优先级、多设备隔离、旧/新凭证不可复活、治理视图消失 | `IdleTimeoutTest`（11 例）、`IdleTimeoutDefaultPropertiesTest`（默认属性值守护）、`IdleTimeoutWiredEntryTest`（真实 Spring 链路+真实时钟） |
 | 日志打印凭证标识与判定依据 | 全部用例（`DECIDE … verdict=… basis=…` 与 `AUDIT …` 日志） |
 
 过期边界测试使用可注入的 `MutableTimeSource`（所有过期判定只依赖该时钟，
@@ -294,6 +309,35 @@ curl -s localhost:8080/api/auth/accounts/alice/sessions
 curl -s -X POST localhost:8080/api/auth/sessions/<sessionId>/revoke \
   -H 'Content-Type: application/json' -d '{"reason":"kick-one-device"}'
 # 被结束会话的 token 再访问 -> 401 SESSION_REVOKED；其余会话不受影响
+```
+
+### 7.2 手工验证空闲超时（默认入口，无需改任何配置）
+
+默认配置 `idle-timeout-millis=600000`（10 分钟）、`ttl-millis=900000`（15 分钟），
+空闲窗口严格短于绝对有效期，因此**按默认配置直接启动即可复现**：
+
+```bash
+mvn spring-boot:run
+# 另一个终端：
+curl -s -X POST localhost:8080/api/auth/login -H 'Content-Type: application/json' \
+  -d '{"username":"alice","password":"alice-pass"}'
+# 拿到 token 后什么都不做，等待 10 分钟（lastActiveAt 停在登录时刻，凭证 15 分钟才过期）
+# 10 分钟后先访问：
+curl -s localhost:8080/api/resources/profile -H "Authorization: Bearer <token>"
+# -> 401，reason=SESSION_IDLE_EXPIRED（而不是 CREDENTIAL_EXPIRED）
+# 再刷新，结论一致：
+curl -s -X POST localhost:8080/api/auth/refresh -H "Authorization: Bearer <token>"
+# -> 401，reason=SESSION_IDLE_EXPIRED
+# 治理列表中该会话已消失：
+curl -s localhost:8080/api/auth/accounts/alice/sessions
+```
+
+不想等待时，可仅在启动命令上把空闲窗口临时调小（判定路径与默认入口完全相同，
+只是把 10 分钟换成 100ms；这一步是“加速”，不是启用空闲能力——默认配置本身已启用）：
+
+```bash
+mvn spring-boot:run -Dspring-boot.run.arguments=--identity.session.idle-timeout-millis=5000
+# 登录后等待 5 秒，再访问/刷新即可看到 SESSION_IDLE_EXPIRED
 ```
 
 ## 7.1 兼容范围

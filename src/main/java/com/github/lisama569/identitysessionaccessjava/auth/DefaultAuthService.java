@@ -39,10 +39,17 @@ import java.util.UUID;
 @Service
 public class DefaultAuthService implements AuthService {
 
+    /** 凭证有效期默认值（15 分钟）。 */
+    public static final long DEFAULT_TTL_MILLIS = 900_000L;
     /** 账号级活跃会话上限默认值。 */
     public static final int DEFAULT_MAX_ACTIVE_SESSIONS = 5;
-    /** 会话空闲超时默认值（30 分钟）。 */
-    public static final long DEFAULT_IDLE_TIMEOUT_MILLIS = 1_800_000L;
+    /**
+     * 会话空闲超时默认值（10 分钟）。
+     *
+     * <p>必须严格小于 {@link #DEFAULT_TTL_MILLIS}：否则凭证总是先到达绝对有效期，
+     * 默认入口下永远观察不到 {@code SESSION_IDLE_EXPIRED}。</p>
+     */
+    public static final long DEFAULT_IDLE_TIMEOUT_MILLIS = 600_000L;
 
     private final UserStore userStore;
     private final SessionStore sessionStore;
@@ -59,7 +66,7 @@ public class DefaultAuthService implements AuthService {
                               PasswordHasher passwordHasher, AuditService audit, TimeSource timeSource,
                               @Value("${identity.session.ttl-millis:900000}") long ttlMillis,
                               @Value("${identity.session.max-active-sessions-per-account:5}") int maxActiveSessions,
-                              @Value("${identity.session.idle-timeout-millis:1800000}") long idleTimeoutMillis) {
+                              @Value("${identity.session.idle-timeout-millis:600000}") long idleTimeoutMillis) {
         this.userStore = userStore;
         this.sessionStore = sessionStore;
         this.tokenService = tokenService;
@@ -69,6 +76,15 @@ public class DefaultAuthService implements AuthService {
         this.ttlMillis = ttlMillis;
         this.maxActiveSessions = maxActiveSessions;
         this.idleTimeoutMillis = idleTimeoutMillis;
+        if (idleTimeoutMillis >= ttlMillis) {
+            // 空闲窗口不短于凭证 TTL 时，凭证必然先绝对过期，空闲超时在该默认入口下不可达。
+            // 不强制抛错（允许显式自定义），但必须给出显著告警，避免再次出现“配了等于没配”。
+            org.slf4j.LoggerFactory.getLogger(DefaultAuthService.class).warn(
+                    "identity.session.idle-timeout-millis({}) >= identity.session.ttl-millis({})："
+                            + "凭证将总是先绝对过期，SESSION_IDLE_EXPIRED 在默认入口下不可达；"
+                            + "若需要观察空闲超时，请把空闲窗口配置为严格小于凭证有效期。",
+                    idleTimeoutMillis, ttlMillis);
+        }
     }
 
     /** 兼容构造：使用默认容量上限与默认空闲超时。 */
