@@ -56,7 +56,7 @@ class ConcurrentRefreshTest {
                 Set.of("USER"), Map.of(), true));
         DefaultAuditService audit = new DefaultAuditService(new InMemoryAuditStore(), clock);
         auth = new DefaultAuthService(users, sessionStore,
-                new LocalHmacTokenService("test-secret"), hasher, audit, clock, 60_000L);
+                new LocalHmacTokenService("test-secret"), hasher, audit, clock, 60_000L, 5, 300_000L);
     }
 
     @RepeatedTest(20)

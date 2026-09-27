@@ -25,6 +25,10 @@ public enum DenyReason {
     CREDENTIAL_REVOKED,
     /** 凭证所属会话被撤销。 */
     SESSION_REVOKED,
+    /** 会话因账号级容量上限被淘汰（最久未活跃者先出局），与主动撤销可区分。 */
+    SESSION_CAPACITY_EVICTED,
+    /** 会话超过空闲上限没有任何活动，与绝对过期（CREDENTIAL_EXPIRED）可区分。 */
+    SESSION_IDLE_TIMEOUT,
     /** 已认证但权限不足。 */
     PERMISSION_DENIED
 }

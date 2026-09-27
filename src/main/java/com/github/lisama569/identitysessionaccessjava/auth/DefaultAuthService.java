@@ -6,16 +6,19 @@ import com.github.lisama569.identitysessionaccessjava.model.CredentialRecord;
 import com.github.lisama569.identitysessionaccessjava.model.CredentialState;
 import com.github.lisama569.identitysessionaccessjava.model.DenyReason;
 import com.github.lisama569.identitysessionaccessjava.model.SessionInfo;
+import com.github.lisama569.identitysessionaccessjava.model.TerminationCause;
 import com.github.lisama569.identitysessionaccessjava.model.UserAccount;
 import com.github.lisama569.identitysessionaccessjava.store.SessionStore;
 import com.github.lisama569.identitysessionaccessjava.store.UserStore;
 import com.github.lisama569.identitysessionaccessjava.time.TimeSource;
 import com.github.lisama569.identitysessionaccessjava.token.TokenPayload;
 import com.github.lisama569.identitysessionaccessjava.token.TokenService;
+import com.github.lisama569.identitysessionaccessjava.web.dto.SessionView;
 import com.github.lisama569.identitysessionaccessjava.web.dto.TokenResponse;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
@@ -42,10 +45,14 @@ public class DefaultAuthService implements AuthService {
     private final AuditService audit;
     private final TimeSource timeSource;
     private final long ttlMillis;
+    private final int maxActiveSessions;
+    private final long idleTimeoutMillis;
 
     public DefaultAuthService(UserStore userStore, SessionStore sessionStore, TokenService tokenService,
                               PasswordHasher passwordHasher, AuditService audit, TimeSource timeSource,
-                              @Value("${identity.session.ttl-millis:900000}") long ttlMillis) {
+                              @Value("${identity.session.ttl-millis:900000}") long ttlMillis,
+                              @Value("${identity.session.max-active-sessions:5}") int maxActiveSessions,
+                              @Value("${identity.session.idle-timeout-millis:300000}") long idleTimeoutMillis) {
         this.userStore = userStore;
         this.sessionStore = sessionStore;
         this.tokenService = tokenService;
@@ -53,6 +60,8 @@ public class DefaultAuthService implements AuthService {
         this.audit = audit;
         this.timeSource = timeSource;
         this.ttlMillis = ttlMillis;
+        this.maxActiveSessions = maxActiveSessions;
+        this.idleTimeoutMillis = idleTimeoutMillis;
     }
 
     /**
@@ -114,10 +123,22 @@ public class DefaultAuthService implements AuthService {
                 account.getUsername(), token, now, now + ttlMillis, version, CredentialState.ACTIVE);
         SessionInfo session = new SessionInfo(sessionId, account.getId(), account.getUsername(),
                 now, ttlMillis, credentialId, version);
-        sessionStore.create(session, credential);
+        // 建会话与容量淘汰在账号级锁内一次完成：并发登录收敛后活跃会话数不超上限；
+        // 被淘汰会话的凭证在同一事务中连带失效，不存在“被淘汰但凭证仍可用”。
+        List<SessionInfo> evicted = sessionStore.createAndEnforceCapacity(
+                session, credential, maxActiveSessions, now);
+        for (SessionInfo victim : evicted) {
+            audit.record(AuditEventType.SESSION_CAPACITY_EVICTED, victim.getUsername(),
+                    victim.getId(), victim.getCurrentCredentialId(), null, null,
+                    DenyReason.SESSION_CAPACITY_EVICTED,
+                    "容量淘汰：账号 " + account.getUsername() + " 活跃会话数超上限 "
+                            + maxActiveSessions + "，最久未活跃会话出局（lastActiveAt="
+                            + victim.getLastActiveAt() + "），名下凭证连带失效");
+        }
 
         audit.record(AuditEventType.LOGIN_SUCCESS, account.getUsername(), sessionId, credentialId,
-                null, null, null, "登录成功，签发凭证 v" + version);
+                null, null, null, "登录成功，签发凭证 v" + version
+                        + (evicted.isEmpty() ? "" : "；本次登录触发容量淘汰 " + evicted.size() + " 个会话"));
         return toResponse(credential, sessionId);
     }
 
@@ -167,7 +188,7 @@ public class DefaultAuthService implements AuthService {
         SessionStore.RefreshOutcome outcome;
         try {
             outcome = sessionStore.atomicRefresh(batch.sessionId(), batch.requestId(),
-                    presentedId, newCredential, now);
+                    presentedId, newCredential, now, idleTimeoutMillis);
         } finally {
             if (autoBatch) {
                 sessionStore.endRefreshAttempt(batch.sessionId(), batch.requestId());
@@ -183,14 +204,34 @@ public class DefaultAuthService implements AuthService {
                 yield toResponse(newCredential, session.getId());
             }
             case REVOKED -> {
-                boolean sessionRevoked = sessionStore.findSession(session.getId())
-                        .map(SessionInfo::isRevoked).orElse(false);
-                DenyReason reason = sessionRevoked
-                        ? DenyReason.SESSION_REVOKED : DenyReason.CREDENTIAL_REVOKED;
+                // 终止类原因再细分：主动撤销 vs 容量淘汰（同属最高优先级，但机器可读原因不同）
+                SessionInfo current = sessionStore.findSession(session.getId()).orElse(null);
+                boolean sessionTerminated = current != null && current.isRevoked();
+                DenyReason reason;
+                if (sessionTerminated
+                        && current.getTerminationCause() == TerminationCause.CAPACITY_EVICTED) {
+                    reason = DenyReason.SESSION_CAPACITY_EVICTED;
+                } else if (sessionTerminated) {
+                    reason = DenyReason.SESSION_REVOKED;
+                } else {
+                    reason = DenyReason.CREDENTIAL_REVOKED;
+                }
                 audit.record(AuditEventType.REFRESH_FAILURE, session.getUsername(),
                         session.getId(), presentedId, null, null, reason,
-                        "锁内权威判定：已撤销（会话撤销位=" + sessionRevoked + "），禁止刷新");
-                throw new AuthenticationException(reason, "凭证已撤销，禁止刷新", presentedId);
+                        "锁内权威判定：会话/凭证已终止（终止原因类别="
+                                + (sessionTerminated ? current.getTerminationCause() : "凭证级撤销")
+                                + "），禁止刷新");
+                throw new AuthenticationException(reason, "凭证已失效（会话被终止或凭证被撤销），禁止刷新",
+                        presentedId);
+            }
+            case IDLE_TIMEOUT -> {
+                audit.record(AuditEventType.REFRESH_FAILURE, session.getUsername(),
+                        session.getId(), presentedId, null, null, DenyReason.SESSION_IDLE_TIMEOUT,
+                        "锁内权威判定：会话空闲超时，lastActiveAt=" + session.getLastActiveAt()
+                                + "，空闲上限=" + idleTimeoutMillis + "ms，当前=" + now
+                                + "（与绝对过期 CREDENTIAL_EXPIRED 可区分）");
+                throw new AuthenticationException(DenyReason.SESSION_IDLE_TIMEOUT,
+                        "会话空闲超时，请重新登录", presentedId);
             }
             case EXPIRED -> {
                 audit.record(AuditEventType.REFRESH_FAILURE, session.getUsername(),
@@ -257,6 +298,34 @@ public class DefaultAuthService implements AuthService {
                 credentialId, null, null, null,
                 "凭证撤销: " + reason + (changed ? "（状态迁移 -> REVOKED，后续访问立即拒绝）"
                         : "（此前已撤销，首次撤销原因保留，无状态覆盖）"));
+    }
+
+    @Override
+    public List<SessionView> listActiveSessions(String username) {
+        long now = timeSource.nowMillis();
+        UserAccount account = username == null ? null
+                : userStore.findByUsername(username).orElse(null);
+        if (account == null) {
+            return List.of();
+        }
+        List<SessionView> views = new ArrayList<>();
+        for (SessionInfo s : sessionStore.findSessionsByUser(account.getId())) {
+            // 活跃 = 未终止 且 未绝对过期 且 未空闲超时（与判定链路同一套标准）
+            if (s.isRevoked() || s.isIdleAt(now, idleTimeoutMillis)) {
+                continue;
+            }
+            CredentialRecord current = sessionStore.findCredential(s.getCurrentCredentialId())
+                    .orElse(null);
+            if (current == null || current.isExpiredAt(now)
+                    || current.getState() != CredentialState.ACTIVE) {
+                continue;
+            }
+            views.add(new SessionView(s.getId(), s.getUsername(), s.getCreatedAt(),
+                    s.getLastActiveAt(), s.getCurrentVersion(), current.getId(),
+                    current.getExpiresAt()));
+        }
+        views.sort(java.util.Comparator.comparingLong(SessionView::issuedAt));
+        return List.copyOf(views);
     }
 
     @Override

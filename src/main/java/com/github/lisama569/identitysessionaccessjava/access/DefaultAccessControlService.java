@@ -7,6 +7,7 @@ import com.github.lisama569.identitysessionaccessjava.model.CredentialRecord;
 import com.github.lisama569.identitysessionaccessjava.model.CredentialState;
 import com.github.lisama569.identitysessionaccessjava.model.DenyReason;
 import com.github.lisama569.identitysessionaccessjava.model.SessionInfo;
+import com.github.lisama569.identitysessionaccessjava.model.TerminationCause;
 import com.github.lisama569.identitysessionaccessjava.model.UserAccount;
 import com.github.lisama569.identitysessionaccessjava.store.SessionStore;
 import com.github.lisama569.identitysessionaccessjava.store.UserStore;
@@ -14,6 +15,7 @@ import com.github.lisama569.identitysessionaccessjava.time.TimeSource;
 import com.github.lisama569.identitysessionaccessjava.token.TokenPayload;
 import com.github.lisama569.identitysessionaccessjava.token.TokenService;
 import org.slf4j.Logger;
+import org.springframework.beans.factory.annotation.Value;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
@@ -25,8 +27,10 @@ import org.springframework.stereotype.Service;
  *   <li>未携带/非法凭证 —— {@code UNAUTHENTICATED}</li>
  *   <li>凭证无法识别 —— {@code CREDENTIAL_NOT_FOUND}</li>
  *   <li>会话不存在 —— {@code SESSION_NOT_FOUND}</li>
- *   <li>会话撤销 / 凭证撤销（撤销优先于一切，含过期与轮换）</li>
- *   <li>凭证过期 —— {@code CREDENTIAL_EXPIRED}（边界：now &gt;= expiresAt）</li>
+ *   <li>会话撤销 / 容量淘汰 / 凭证撤销（终止类原因优先于一切，含过期、空闲与轮换；
+ *       容量淘汰 {@code SESSION_CAPACITY_EVICTED} 与主动撤销 {@code SESSION_REVOKED} 可区分）</li>
+ *   <li>凭证绝对过期 —— {@code CREDENTIAL_EXPIRED}（边界：now &gt;= expiresAt）</li>
+ *   <li>会话空闲超时 —— {@code SESSION_IDLE_TIMEOUT}（边界：now &gt;= lastActiveAt + idleTimeout）</li>
  *   <li>凭证已轮换 —— {@code CREDENTIAL_ROTATED}</li>
  *   <li>非会话当前凭证 —— {@code CONCURRENT_REFRESH_CONFLICT}</li>
  *   <li>账户停用 —— {@code USER_DISABLED}</li>
@@ -47,16 +51,20 @@ public class DefaultAccessControlService implements AccessControlService {
     private final PolicyRegistry policyRegistry;
     private final AuditService audit;
     private final TimeSource timeSource;
+    private final long idleTimeoutMillis;
 
     public DefaultAccessControlService(TokenService tokenService, SessionStore sessionStore,
                                        UserStore userStore, PolicyRegistry policyRegistry,
-                                       AuditService audit, TimeSource timeSource) {
+                                       AuditService audit, TimeSource timeSource,
+                                       @Value("${identity.session.idle-timeout-millis:300000}")
+                                       long idleTimeoutMillis) {
         this.tokenService = tokenService;
         this.sessionStore = sessionStore;
         this.userStore = userStore;
         this.policyRegistry = policyRegistry;
         this.audit = audit;
         this.timeSource = timeSource;
+        this.idleTimeoutMillis = idleTimeoutMillis;
     }
 
     @Override
@@ -84,8 +92,16 @@ public class DefaultAccessControlService implements AccessControlService {
             return deny(DenyReason.SESSION_NOT_FOUND, "凭证所属会话不存在", permission, resource,
                     credential.getUserId(), credential.getUsername(), sid, cid);
         }
-        // 撤销优先：保证“已撤销/降权身份绝不因过期判定或缓存而放行”
+        // 终止类原因优先：保证“已终止身份绝不因过期/空闲/轮换判定或缓存而放行”；
+        // 容量淘汰与主动撤销同属终止类，但机器可读原因可区分
         if (session.isRevoked()) {
+            if (session.getTerminationCause() == TerminationCause.CAPACITY_EVICTED) {
+                return deny(DenyReason.SESSION_CAPACITY_EVICTED,
+                        "会话因账号容量上限于 " + session.getRevokedAt()
+                                + " 被淘汰（最久未活跃者先出局），名下凭证全部失效",
+                        permission, resource, credential.getUserId(), credential.getUsername(),
+                        sid, cid);
+            }
             return deny(DenyReason.SESSION_REVOKED,
                     "会话已于 " + session.getRevokedAt() + " 被撤销（原因: "
                             + session.getRevokeReason() + "），名下凭证全部失效",
@@ -98,6 +114,13 @@ public class DefaultAccessControlService implements AccessControlService {
         if (credential.isExpiredAt(now)) {
             return deny(DenyReason.CREDENTIAL_EXPIRED,
                     "凭证已于 " + credential.getExpiresAt() + " 过期（当前 " + now + "，边界 now>=expiresAt）",
+                    permission, resource, credential.getUserId(), credential.getUsername(), sid, cid);
+        }
+        if (session.isIdleAt(now, idleTimeoutMillis)) {
+            return deny(DenyReason.SESSION_IDLE_TIMEOUT,
+                    "会话空闲超时：lastActiveAt=" + session.getLastActiveAt() + "，空闲上限="
+                            + idleTimeoutMillis + "ms，当前 " + now
+                            + "（与绝对过期 CREDENTIAL_EXPIRED 可区分）",
                     permission, resource, credential.getUserId(), credential.getUsername(), sid, cid);
         }
         if (credential.getState() == CredentialState.ROTATED) {
@@ -138,6 +161,8 @@ public class DefaultAccessControlService implements AccessControlService {
                     permission, resource, account.getId(), account.getUsername(), sid, cid);
         }
 
+        // 访问放行即一次活动：顺延会话空闲窗口（单调递增原子写，可并发）
+        session.touch(now);
         AuthDecision decision = AuthDecision.allow(permission, resource, account.getId(),
                 account.getUsername(), sid, cid);
         log.info("DECIDE credential={} permission={} resource={} verdict=ALLOW basis=策略实时求值通过",

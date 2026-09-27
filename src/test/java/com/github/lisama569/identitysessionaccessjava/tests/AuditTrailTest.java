@@ -54,9 +54,9 @@ class AuditTrailTest {
                 Set.of("USER"), Map.of("dept", "engineering"), true));
         audit = new DefaultAuditService(new InMemoryAuditStore(), clock);
         LocalHmacTokenService tokens = new LocalHmacTokenService("secret");
-        auth = new DefaultAuthService(users, sessions, tokens, hasher, audit, clock, 60_000L);
+        auth = new DefaultAuthService(users, sessions, tokens, hasher, audit, clock, 60_000L, 5, 300_000L);
         access = new DefaultAccessControlService(tokens, sessions, users,
-                new PolicyRegistry(), audit, clock);
+                new PolicyRegistry(), audit, clock, 300_000L);
     }
 
     @Test

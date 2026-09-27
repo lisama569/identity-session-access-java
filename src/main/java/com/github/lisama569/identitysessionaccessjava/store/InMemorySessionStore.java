@@ -3,6 +3,7 @@ package com.github.lisama569.identitysessionaccessjava.store;
 import com.github.lisama569.identitysessionaccessjava.model.CredentialRecord;
 import com.github.lisama569.identitysessionaccessjava.model.CredentialState;
 import com.github.lisama569.identitysessionaccessjava.model.SessionInfo;
+import com.github.lisama569.identitysessionaccessjava.model.TerminationCause;
 import org.springframework.stereotype.Repository;
 
 import java.util.ArrayList;
@@ -26,6 +27,10 @@ public class InMemorySessionStore implements SessionStore {
     private final ConcurrentHashMap<String, CredentialRecord> credentials = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, List<String>> sessionCredentialIds = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Object> locks = new ConcurrentHashMap<>();
+    /** 账号 -> 名下会话 id 索引（只增；会话对象本身承载终止状态）。 */
+    private final ConcurrentHashMap<String, List<String>> userSessionIds = new ConcurrentHashMap<>();
+    /** 账号级锁：容量淘汰与登录建会话在其内串行，保证并发登录收敛后不超上限。 */
+    private final ConcurrentHashMap<String, Object> userLocks = new ConcurrentHashMap<>();
     /**
      * 每个会话当前刷新批次的参与者请求标识集合（begin 时锁外登记，end 时锁内移除）。
      */
@@ -48,6 +53,81 @@ public class InMemorySessionStore implements SessionStore {
         List<String> ids = Collections.synchronizedList(new ArrayList<>());
         ids.add(credential.getId());
         sessionCredentialIds.put(session.getId(), ids);
+        registerUserSession(session);
+    }
+
+    @Override
+    public List<SessionInfo> createAndEnforceCapacity(SessionInfo session, CredentialRecord credential,
+                                                      int maxActiveSessions, long nowMillis) {
+        if (session == null || credential == null) {
+            throw new IllegalArgumentException("session 与 credential 不能为空");
+        }
+        Object userLock = userLocks.computeIfAbsent(session.getUserId(), k -> new Object());
+        synchronized (userLock) {
+            // 建会话（与 create 相同的入库步骤，但在账号级锁内完成）
+            sessions.put(session.getId(), session);
+            credentials.put(credential.getId(), credential);
+            List<String> ids = Collections.synchronizedList(new ArrayList<>());
+            ids.add(credential.getId());
+            sessionCredentialIds.put(session.getId(), ids);
+            registerUserSession(session);
+
+            if (maxActiveSessions <= 0) {
+                return List.of();
+            }
+            // 活跃 = 未被终止；淘汰候选不含本次新建的会话（它刚发生活动，
+            // 按“最久未活跃者先出局”语义必然最晚出局，并列时不得误杀新会话）。
+            List<SessionInfo> candidates = new ArrayList<>();
+            int activeCount = 0;
+            for (SessionInfo s : findSessionsByUser(session.getUserId())) {
+                if (!s.isRevoked()) {
+                    activeCount++;
+                    if (!s.getId().equals(session.getId())) {
+                        candidates.add(s);
+                    }
+                }
+            }
+            candidates.sort(java.util.Comparator
+                    .comparingLong(SessionInfo::getLastActiveAt)
+                    .thenComparingLong(SessionInfo::getCreatedAt)
+                    .thenComparing(SessionInfo::getId));
+            List<SessionInfo> evicted = new ArrayList<>();
+            int excess = activeCount - maxActiveSessions;
+            for (int i = 0; i < excess && i < candidates.size(); i++) {
+                SessionInfo victim = candidates.get(i);
+                // 终止走与会话撤销相同的会话级锁（锁序：账号锁 -> 会话锁，
+                // 刷新/撤销路径只取会话锁，不构成环），与并发刷新串行化。
+                atomicTerminateSession(victim.getId(),
+                        "容量淘汰：账号活跃会话数超上限 " + maxActiveSessions
+                                + "，最久未活跃者先出局",
+                        TerminationCause.CAPACITY_EVICTED, nowMillis);
+                evicted.add(victim);
+            }
+            return List.copyOf(evicted);
+        }
+    }
+
+    private void registerUserSession(SessionInfo session) {
+        userSessionIds.computeIfAbsent(session.getUserId(),
+                k -> Collections.synchronizedList(new ArrayList<>())).add(session.getId());
+    }
+
+    @Override
+    public List<SessionInfo> findSessionsByUser(String userId) {
+        List<String> ids = userSessionIds.get(userId);
+        if (ids == null) {
+            return List.of();
+        }
+        List<SessionInfo> result = new ArrayList<>();
+        synchronized (ids) {
+            for (String id : ids) {
+                SessionInfo s = sessions.get(id);
+                if (s != null) {
+                    result.add(s);
+                }
+            }
+        }
+        return List.copyOf(result);
     }
 
     @Override
@@ -117,7 +197,8 @@ public class InMemorySessionStore implements SessionStore {
     @Override
     public RefreshOutcome atomicRefresh(String batchHandle, String requestId,
                                         String presentedCredentialId,
-                                        CredentialRecord newCredential, long nowMillis) {
+                                        CredentialRecord newCredential, long nowMillis,
+                                        long idleTimeoutMillis) {
         if (presentedCredentialId == null || newCredential == null) {
             throw new IllegalArgumentException("参数不能为空");
         }
@@ -132,23 +213,29 @@ public class InMemorySessionStore implements SessionStore {
             if (session == null) {
                 return RefreshOutcome.of(RefreshOutcome.Kind.SESSION_NOT_FOUND, null);
             }
-            return doRefresh(session, requestId, presented, newCredential, nowMillis);
+            return doRefresh(session, requestId, presented, newCredential, nowMillis,
+                    idleTimeoutMillis);
         }
     }
 
     /** 必须在会话级锁内调用。 */
     private RefreshOutcome doRefresh(SessionInfo session, String requestId,
                                      CredentialRecord presented, CredentialRecord newCredential,
-                                     long nowMillis) {
+                                     long nowMillis, long idleTimeoutMillis) {
         String sessionId = session.getId();
-        // 1) 撤销优先于一切（含过期与轮换）
+        // 1) 撤销优先于一切（含过期、空闲与轮换）；容量淘汰同属终止类，走同一分支
         if (session.isRevoked() || presented.getState() == CredentialState.REVOKED) {
             return RefreshOutcome.of(RefreshOutcome.Kind.REVOKED,
                     session.getCurrentCredentialId());
         }
-        // 2) 过期其次（边界 now >= expiresAt）
+        // 2) 绝对过期其次（边界 now >= expiresAt）
         if (presented.isExpiredAt(nowMillis)) {
             return RefreshOutcome.of(RefreshOutcome.Kind.EXPIRED,
+                    session.getCurrentCredentialId());
+        }
+        // 3) 空闲超时再次之（边界 now >= lastActiveAt + idleTimeout）
+        if (session.isIdleAt(nowMillis, idleTimeoutMillis)) {
+            return RefreshOutcome.of(RefreshOutcome.Kind.IDLE_TIMEOUT,
                     session.getCurrentCredentialId());
         }
         boolean isCurrent = presented.getId().equals(session.getCurrentCredentialId());
@@ -186,6 +273,8 @@ public class InMemorySessionStore implements SessionStore {
             list.add(newCredential.getId());
         }
         session.rotate(newCredential.getId(), newCredential.getVersion());
+        // 刷新成功：顺延空闲窗口（锁内完成，与上述判定同属一次原子事务）
+        session.touch(nowMillis);
         // 在锁内快照同批竞争者：begin 在屏障之后、任何服务调用之前完成，
         // 因此此刻批次中的其他请求必然是并发竞争者，而非事后重放。
         java.util.Set<String> batch = refreshBatches.get(sessionId);
@@ -200,6 +289,12 @@ public class InMemorySessionStore implements SessionStore {
 
     @Override
     public List<CredentialRecord> atomicRevokeSession(String sessionId, String reason, long nowMillis) {
+        return atomicTerminateSession(sessionId, reason, TerminationCause.USER_REVOKED, nowMillis);
+    }
+
+    @Override
+    public List<CredentialRecord> atomicTerminateSession(String sessionId, String reason,
+                                                         TerminationCause cause, long nowMillis) {
         if (sessionId == null) {
             return null;
         }
@@ -209,8 +304,8 @@ public class InMemorySessionStore implements SessionStore {
             if (session == null) {
                 return null;
             }
-            // markRevoked 保留首次撤销原因，保证并发撤销不互相覆盖
-            session.markRevoked(nowMillis, reason);
+            // markTerminated 保留首次终止原因与类别，保证并发终止不互相覆盖
+            session.markTerminated(nowMillis, reason, cause);
             List<CredentialRecord> changed = new ArrayList<>();
             for (CredentialRecord c : credentialsOfSession(sessionId)) {
                 if (c.getState() != CredentialState.REVOKED) {

@@ -22,11 +22,20 @@
 撤销 revokeSession / revokeCredential
   └─ 会话撤销（根撤销）：会话 revoked=true，名下所有凭证 -> REVOKED
      凭证撤销：仅该凭证 -> REVOKED
+容量淘汰（账号级会话上限，默认 5）
+  └─ 登录建会话与淘汰在账号级锁内一次完成：活跃会话超上限时，
+     最久未活跃（lastActiveAt 最小）的会话被终止（CAPACITY_EVICTED），
+     名下凭证连带 REVOKED；本次新建的会话不参与淘汰候选
+空闲超时（默认 5 分钟）
+  └─ 惰性判定：now >= lastActiveAt + idleTimeout 即 SESSION_IDLE_TIMEOUT；
+     刷新成功与访问放行都会顺延 lastActiveAt（滑动窗口），不做后台扫描
 过期
   └─ 惰性判定：now >= expiresAt 即 EXPIRED（过期边界含等于），不做后台扫描
 ```
 
 凭证有四种互斥终态：`ACTIVE` / `ROTATED` / `EXPIRED` / `REVOKED`。
+会话终止原因（`TerminationCause`）分为 `USER_REVOKED`（主动撤销/定向踢除）与
+`CAPACITY_EVICTED`（容量淘汰），终止后不存在任何“重新激活”路径。
 
 ### 1.1 轮换后旧凭证何时失效？
 
@@ -65,6 +74,64 @@
 
 ---
 
+### 1.4 多设备会话治理
+
+同一账号在多台设备登录后，每个设备一个独立会话，互不影响：
+
+- **按账号查看活跃会话**：`GET /api/auth/accounts/{username}/sessions`
+  （服务层对应 `AuthService.listActiveSessions(username)`）。返回该账号名下
+  **尚未失效**（未终止、未绝对过期、未空闲超时）的会话列表，每项含
+  `sessionId`、`issuedAt`（签发时间）、`lastActiveAt`（最近活跃时间）、
+  `currentVersion`（当前凭证代次）、`currentCredentialId`、
+  `currentCredentialExpiresAt`。
+- **只结束其中一个设备**：`POST /api/auth/sessions/{sessionId}/revoke`
+  （既有会话撤销入口）。被结束的会话立即失效（访问与刷新都报
+  `SESSION_REVOKED`），同账号其余会话照常可用；已结束会话**不能被重新激活**，
+  时间推移后原因仍稳定为撤销类。
+- 拒绝语义与既有登录/刷新/撤销完全一致：同一套 `DenyReason` 机器可读原因码 +
+  同一套状态码约定（认证类 401、权限不足 403），不引入新的说法。
+
+### 1.5 账号级会话容量控制
+
+- 配置项：`identity.session.max-active-sessions`，**默认 5**；`<= 0` 表示不限制。
+- 规则：登录建立新会话时，若该账号活跃会话数超过上限，按
+  **最久未活跃者先出局**（`lastActiveAt` 升序，并列时按 `createdAt`、会话 id）
+  自动终止最早的那批会话，直到不超上限。本次新建的会话不参与淘汰候选。
+- 原子性：建会话与淘汰在**账号级锁**内一次完成；淘汰每个会话走与撤销相同的
+  **会话级锁**（锁序固定为 账号锁 → 会话锁，与刷新/撤销路径不构成死锁）。
+  因此并发登录、并发刷新与容量淘汰同时发生时，**收敛后活跃会话数必然 ≤ 上限**；
+  被淘汰会话名下所有凭证（含并发刷新刚赢出的新凭证）连带 REVOKED，
+  不存在“被淘汰但凭证仍可用”“多会话共用一张有效凭证”或“凭证静默复活”。
+- 被淘汰后再使用旧凭证：拒绝原因为 **`SESSION_CAPACITY_EVICTED`**（401），
+  与 `UNAUTHENTICATED` / `CREDENTIAL_EXPIRED` / `SESSION_REVOKED` 互相区分；
+  淘汰动作写审计事件 `SESSION_CAPACITY_EVICTED`。
+
+### 1.6 会话空闲超时
+
+- 配置项：`identity.session.idle-timeout-millis`，**默认 300000（5 分钟）**；
+  `<= 0` 表示关闭空闲判定。
+- 规则：在绝对有效期（`identity.session.ttl-millis`，默认 15 分钟）之外，
+  另判 `now >= lastActiveAt + idleTimeout`（边界含等于，与绝对过期风格一致）。
+  **刷新成功**与**访问放行**都会顺延 `lastActiveAt`（滑动窗口）；
+  权限不足等被拒绝的访问不算活动、不顺延。
+- 长时间无活动的会话即使未到绝对有效期，下一次访问或刷新也会被拒绝，
+  原因为 **`SESSION_IDLE_TIMEOUT`**（401），与绝对过期 `CREDENTIAL_EXPIRED` 可区分。
+- 空闲判定是惰性的（判定路径上实时计算），不需要调用方做任何配合。
+
+#### 拒绝原因优先级（叠加时的稳定顺序）
+
+终止类原因优先于一切，其后依次是绝对过期、空闲超时、轮换、并发冲突：
+
+`SESSION_REVOKED` / `SESSION_CAPACITY_EVICTED` / `CREDENTIAL_REVOKED`
+→ `CREDENTIAL_EXPIRED`（绝对过期）→ `SESSION_IDLE_TIMEOUT`（空闲）
+→ `CREDENTIAL_ROTATED` → `CONCURRENT_REFRESH_CONFLICT` → `USER_DISABLED`
+→ `PERMISSION_DENIED`
+
+刷新链路（会话锁内权威判定）与访问链路使用**同一优先级**，因此同一张凭证
+在任意入口得到的拒绝原因一致。
+
+---
+
 ## 2. 权限判定规则
 
 统一入口：`AccessControlService.decide(token, permission, resource)`。
@@ -76,12 +143,14 @@
 1. `UNAUTHENTICATED`：未携带令牌 / 格式非法 / 签名无效
 2. `CREDENTIAL_NOT_FOUND`：签名合法但凭证标识不存在
 3. `SESSION_NOT_FOUND`：凭证所属会话不存在
-4. `SESSION_REVOKED` / `CREDENTIAL_REVOKED`：**撤销优先于一切**（优先于过期、轮换）
-5. `CREDENTIAL_EXPIRED`：过期（边界 now ≥ expiresAt）
-6. `CREDENTIAL_ROTATED`：凭证已轮换
-7. `CONCURRENT_REFRESH_CONFLICT`：非当前凭证（并发竞争失败）
-8. `USER_DISABLED`：账户被停用 / 移除
-9. `PERMISSION_DENIED`：已认证但无权限
+4. `SESSION_REVOKED` / `SESSION_CAPACITY_EVICTED` / `CREDENTIAL_REVOKED`：
+   **终止类原因优先于一切**（优先于过期、空闲、轮换）
+5. `CREDENTIAL_EXPIRED`：绝对过期（边界 now ≥ expiresAt）
+6. `SESSION_IDLE_TIMEOUT`：空闲超时（边界 now ≥ lastActiveAt + idleTimeout）
+7. `CREDENTIAL_ROTATED`：凭证已轮换
+8. `CONCURRENT_REFRESH_CONFLICT`：非当前凭证（并发竞争失败）
+9. `USER_DISABLED`：账户被停用 / 移除
+10. `PERMISSION_DENIED`：已认证但无权限
 
 授权模型：
 
@@ -125,6 +194,9 @@
   - 撤销先提交 ⇒ 刷新在锁内看到撤销位，返回 `SESSION_REVOKED`，不产生新凭证。
   不会出现“撤销被刷新覆盖”或“新凭证静默复活”。
 - **重复撤销幂等**：`markRevoked` 保留**首次**撤销原因与时刻，不会互相覆盖。
+- **容量淘汰同属终止**：容量淘汰与主动撤销走同一把会话锁、同一套连带失效与
+  传播语义，区别只是终止原因类别（`CAPACITY_EVICTED`）被记录下来，
+  使后续拒绝原因 `SESSION_CAPACITY_EVICTED` 与 `SESSION_REVOKED` 可区分。
 - 每次撤销（会话级/凭证级）都写审计：`SESSION_REVOKED` + 每张连带凭证一条
   `CREDENTIAL_REVOKED`。
 
@@ -137,7 +209,8 @@
 脱敏）。事件类型覆盖：
 
 `LOGIN_SUCCESS / LOGIN_FAILURE / REFRESH_SUCCESS / REFRESH_FAILURE /
-ACCESS_ALLOWED / ACCESS_DENIED / SESSION_REVOKED / CREDENTIAL_REVOKED`
+ACCESS_ALLOWED / ACCESS_DENIED / SESSION_REVOKED / CREDENTIAL_REVOKED /
+SESSION_CAPACITY_EVICTED`
 
 查询接口：
 
@@ -154,8 +227,9 @@ ACCESS_ALLOWED / ACCESS_DENIED / SESSION_REVOKED / CREDENTIAL_REVOKED`
 | 方法与路径 | 说明 |
 |---|---|
 | `POST /api/auth/login` | 登录，返回短期凭证（token / sessionId / credentialId / version / expiresAt） |
-| `POST /api/auth/refresh` | 凭 `Authorization: Bearer` 刷新轮换；成功后旧凭证立即失效 |
-| `POST /api/auth/sessions/{id}/revoke` | 撤销会话（根撤销，body 可选 `{"reason":"…"}`） |
+| `POST /api/auth/refresh` | 凭 `Authorization: Bearer` 刷新轮换；成功后旧凭证立即失效，空闲窗口顺延 |
+| `GET /api/auth/accounts/{username}/sessions` | 多设备治理：列出该账号当前活跃会话（签发/最近活跃/凭证代次） |
+| `POST /api/auth/sessions/{id}/revoke` | 撤销会话（根撤销，body 可选 `{"reason":"…"}`）；也用于“只踢掉一个设备” |
 | `POST /api/auth/credentials/{id}/revoke` | 撤销单张凭证 |
 | `GET /api/resources/profile` | 需要 `profile:read` |
 | `GET /api/resources/reports?resource=finance-reports` | 需要 `reports:read` |
@@ -172,7 +246,7 @@ ACCESS_ALLOWED / ACCESS_DENIED / SESSION_REVOKED / CREDENTIAL_REVOKED`
 ## 6. 验证方法
 
 ```bash
-# 全量测试（73 个用例，含并发重复压测）
+# 全量测试（125 个用例，含并发重复压测）
 mvn test
 
 # 仅并发刷新（16 线程 × 20 次重复 + 2 线程确定性用例）
@@ -180,6 +254,9 @@ mvn test -Dtest=ConcurrentRefreshTest
 
 # 撤销与刷新并发（30 次重复）
 mvn test -Dtest=RevokeConcurrencyTest
+
+# 多设备治理 / 容量上限与并发淘汰 / 空闲超时与原因优先级
+mvn test -Dtest=SessionGovernanceTest,SessionCapacityTest,IdleTimeoutTest,SessionGovernanceWebTest
 
 # 过期边界 / 轮换重放 / 撤销后访问 / RBAC+ABAC / 降权即时生效
 mvn test -Dtest=AuthServiceTest,AccessControlServiceTest,AuditTrailTest
@@ -201,6 +278,12 @@ mvn test -Dtest=WebApiIntegrationTest
 | 未认证/过期/轮换/撤销/权限不足原因可区分 | `AccessControlServiceTest`、`WebApiIntegrationTest` |
 | RBAC + ABAC、默认拒绝、降权/停用即时生效 | `AccessControlServiceTest.roleAndAttributePoliciesAndDefaultDeny`、`demotionAndDisableTakeEffectOnNextDecisionWithoutCache` |
 | 登录/刷新/拒绝/撤销审计留痕、可按会话追溯 | `AuditTrailTest` |
+| 同账号多会话互不影响、定向结束单会话、已结束不复活 | `SessionGovernanceTest` |
+| 容量上限：最久未活跃先出局、原因可区分 | `SessionCapacityTest.leastRecentlyActiveSessionIsEvictedFirst`、`capacityEvictionReasonIsDistinctFromRevokeExpiryAndUnauthenticated` |
+| 并发登录/刷新与淘汰竞争：收敛后不超上限、被淘汰凭证不可用 | `SessionCapacityTest.concurrentLoginsNeverExceedCapacity`（×20）、`refreshRacingEvictionNeverLeavesUsableCredential`（×20） |
+| 空闲超时边界、刷新/访问顺延、与绝对过期区分 | `IdleTimeoutTest.idleBoundaryIsExactAndDistinctFromAbsoluteExpiry`、`refreshSuccessSlidesIdleWindow`、`allowedAccessSlidesIdleWindowButDeniedAccessDoesNot` |
+| 撤销/轮换/淘汰与空闲叠加时的原因优先级 | `IdleTimeoutTest.terminationReasonsBeatIdleAndIdleBeatsRotation`、`absoluteExpiryIsReportedWhenItPrecedesIdle` |
+| 治理入口 HTTP 端到端（列表/定向结束/容量/空闲） | `SessionGovernanceWebTest` |
 | 日志打印凭证标识与判定依据 | 全部用例（`DECIDE … verdict=… basis=…` 与 `AUDIT …` 日志） |
 
 过期边界测试使用可注入的 `MutableTimeSource`（所有过期判定只依赖该时钟，
@@ -217,13 +300,37 @@ curl -s -X POST localhost:8080/api/auth/login -H 'Content-Type: application/json
 curl -s localhost:8080/api/resources/profile -H "Authorization: Bearer <token>"
 curl -s -X POST localhost:8080/api/auth/refresh -H "Authorization: Bearer <token>"
 # 旧 token 再访问 -> 401 CREDENTIAL_ROTATED
+
+# 多设备治理：同账号再登录几次，然后查看活跃会话
+curl -s localhost:8080/api/auth/accounts/alice/sessions
+# 只踢掉其中一个设备：
+curl -s -X POST localhost:8080/api/auth/sessions/<sessionId>/revoke \
+  -H 'Content-Type: application/json' -d '{"reason":"kick-device"}'
+# 该设备凭证再访问 -> 401 SESSION_REVOKED；其余设备照常
+# 登录超过 5 个会话后，最早会话的凭证再访问 -> 401 SESSION_CAPACITY_EVICTED
 ```
 
-## 8. 关键代码索引
+## 8. 配置项与兼容范围
 
-- 并发原子性：`store/InMemorySessionStore.java`（会话锁、原子轮换、批次名单）
-- 失败原因映射：`auth/DefaultAuthService.java`（刷新）、
-  `access/DefaultAccessControlService.java`（访问判定优先级）
-- 状态机：`model/CredentialState.java`、`model/SessionInfo.java`、`model/DenyReason.java`
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `identity.session.ttl-millis` | 900000（15 分钟） | 凭证绝对有效期 |
+| `identity.session.max-active-sessions` | 5 | 同账号同时活跃会话上限；`<=0` 不限制 |
+| `identity.session.idle-timeout-millis` | 300000（5 分钟） | 会话空闲上限；`<=0` 关闭空闲判定 |
+| `identity.token.secret` | local-dev-secret-change-me | 本地 HMAC 密钥 |
+
+兼容范围：新能力全部在默认入口直接生效，调用方无需特殊配合；既有登录、刷新、
+撤销、访问判定的请求/响应格式与状态码约定不变，仅新增两个机器可读拒绝原因
+（`SESSION_CAPACITY_EVICTED`、`SESSION_IDLE_TIMEOUT`）与一个只读查询端点，
+旧的拒绝原因语义保持不变。
+
+## 9. 关键代码索引
+
+- 并发原子性：`store/InMemorySessionStore.java`（会话锁、账号级锁、原子轮换、
+  批次名单、容量淘汰）
+- 失败原因映射：`auth/DefaultAuthService.java`（刷新、登录容量淘汰、会话列表）、
+  `access/DefaultAccessControlService.java`（访问判定优先级、空闲判定与顺延）
+- 状态机：`model/CredentialState.java`、`model/SessionInfo.java`（lastActiveAt /
+  终止原因）、`model/DenyReason.java`、`model/TerminationCause.java`
 - 本地令牌：`token/LocalHmacTokenService.java`
 - 时钟：`time/TimeSource.java`（`SystemTimeSource` / 测试用 `MutableTimeSource`）

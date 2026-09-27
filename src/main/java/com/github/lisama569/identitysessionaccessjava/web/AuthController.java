@@ -3,8 +3,10 @@ package com.github.lisama569.identitysessionaccessjava.web;
 import com.github.lisama569.identitysessionaccessjava.auth.AuthService;
 import com.github.lisama569.identitysessionaccessjava.web.dto.LoginRequest;
 import com.github.lisama569.identitysessionaccessjava.web.dto.RevokeRequest;
+import com.github.lisama569.identitysessionaccessjava.web.dto.SessionView;
 import com.github.lisama569.identitysessionaccessjava.web.dto.TokenResponse;
 import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -12,6 +14,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -40,6 +43,20 @@ public class AuthController {
     public TokenResponse refresh() {
         // 未携带凭证时由 AccessControl 同款原因码表达：这里交由服务判定为 CREDENTIAL_NOT_FOUND
         return authService.refresh(CurrentCredentialHolder.get());
+    }
+
+    /**
+     * 多设备会话治理：列出账号名下当前活跃会话（签发时间、最近活跃时间、
+     * 当前凭证代次）。配合下方 {@code POST /sessions/{sessionId}/revoke}
+     * 可实现“只踢掉其中一个设备”，其余会话不受影响。
+     */
+    @GetMapping("/accounts/{username}/sessions")
+    public Map<String, Object> listAccountSessions(@PathVariable String username) {
+        List<SessionView> sessions = authService.listActiveSessions(username);
+        return Map.of(
+                "username", username,
+                "activeSessionCount", sessions.size(),
+                "sessions", sessions);
     }
 
     @PostMapping("/sessions/{sessionId}/revoke")

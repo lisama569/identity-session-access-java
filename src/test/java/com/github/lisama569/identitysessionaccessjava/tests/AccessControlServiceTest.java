@@ -64,9 +64,9 @@ class AccessControlServiceTest {
                         && parseInt(account.getAttributes().get("level")) >= 5));
         DefaultAuditService audit = new DefaultAuditService(new InMemoryAuditStore(), clock);
         LocalHmacTokenService tokens = new LocalHmacTokenService("secret");
-        auth = new DefaultAuthService(users, sessionStore, tokens, hasher, audit, clock, TTL);
+        auth = new DefaultAuthService(users, sessionStore, tokens, hasher, audit, clock, TTL, 5, 300_000L);
         access = new DefaultAccessControlService(tokens, sessionStore, users, registry,
-                audit, clock);
+                audit, clock, 300_000L);
     }
 
     private static int parseInt(String s) {

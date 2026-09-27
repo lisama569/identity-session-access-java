@@ -21,6 +21,21 @@ public interface SessionStore {
     /** 登录建会话：会话与其首张凭证一起入库。 */
     void create(SessionInfo session, CredentialRecord credential);
 
+    /**
+     * 登录建会话并在同一账号级锁内执行容量淘汰：先入库新会话，
+     * 再按“最久未活跃者先出局”（lastActiveAt 升序，并列时 createdAt 升序）
+     * 终止超出上限的会话，直到该账号活跃会话数 &lt;= maxActiveSessions。
+     * 整个“建会话 + 淘汰”在账号级锁内一次完成，因此并发登录收敛后
+     * 活跃会话数必然不超过上限。maxActiveSessions &lt;= 0 表示不限制。
+     *
+     * @return 被容量淘汰而终止的会话（可能为空）
+     */
+    List<SessionInfo> createAndEnforceCapacity(SessionInfo session, CredentialRecord credential,
+                                               int maxActiveSessions, long nowMillis);
+
+    /** 列出账号名下全部会话（含已终止），供会话治理与容量判定使用。 */
+    List<SessionInfo> findSessionsByUser(String userId);
+
     Optional<SessionInfo> findSession(String sessionId);
 
     Optional<CredentialRecord> findCredential(String credentialId);
@@ -44,11 +59,14 @@ public interface SessionStore {
 
     /**
      * 原子刷新轮换。调用方先通过 {@link #beginRefreshAttempt} 登记批次；
-     * 身份/状态/当前指针的全部权威判定都在会话锁内完成，结果由 {@link RefreshOutcome} 表达。
+     * 身份/状态/当前指针/空闲超时的全部权威判定都在会话锁内完成，结果由 {@link RefreshOutcome} 表达。
+     * 刷新成功会在锁内顺延会话最近活跃时间（空闲窗口随之后移）。
+     *
+     * @param idleTimeoutMillis 空闲上限；&lt;= 0 表示关闭空闲判定
      */
     RefreshOutcome atomicRefresh(String batchHandle, String requestId,
                                  String presentedCredentialId, CredentialRecord newCredential,
-                                 long nowMillis);
+                                 long nowMillis, long idleTimeoutMillis);
 
     /** 刷新尝试结束（无论成功失败），释放批次占位。 */
     void endRefreshAttempt(String batchHandle, String requestId);
@@ -59,6 +77,17 @@ public interface SessionStore {
      * @return 被连带撤销（状态发生迁移）的凭证；会话不存在返回 null
      */
     List<CredentialRecord> atomicRevokeSession(String sessionId, String reason, long nowMillis);
+
+    /**
+     * 原子终止会话（指定终止原因类别）：与 {@link #atomicRevokeSession} 同一会话锁、
+     * 同一连带凭证失效语义，区别只在终止原因类别（主动撤销 / 容量淘汰）被记录下来，
+     * 使后续拒绝原因可区分。
+     *
+     * @return 被连带失效（状态发生迁移）的凭证；会话不存在返回 null
+     */
+    List<CredentialRecord> atomicTerminateSession(String sessionId, String reason,
+                                                  com.github.lisama569.identitysessionaccessjava.model.TerminationCause cause,
+                                                  long nowMillis);
 
     /** 撤销单张凭证（凭证级撤销）；凭证不存在返回 false。 */
     boolean atomicRevokeCredential(String credentialId, String reason, long nowMillis);
@@ -84,7 +113,9 @@ public interface SessionStore {
              */
             SUPERSEDED_REPLAY,
             /** 进入锁时凭证已过期（边界 now &gt;= expiresAt）。 */
-            EXPIRED
+            EXPIRED,
+            /** 进入锁时会话已超过空闲上限（now &gt;= lastActiveAt + idleTimeout）。 */
+            IDLE_TIMEOUT
         }
 
         private final Kind kind;

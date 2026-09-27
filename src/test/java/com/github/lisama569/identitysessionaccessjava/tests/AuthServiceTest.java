@@ -49,7 +49,7 @@ class AuthServiceTest {
                 Set.of("USER"), Map.of(), false));
         DefaultAuditService audit = new DefaultAuditService(new InMemoryAuditStore(), clock);
         auth = new DefaultAuthService(users, sessionStore,
-                new LocalHmacTokenService("test-secret"), hasher, audit, clock, TTL);
+                new LocalHmacTokenService("test-secret"), hasher, audit, clock, TTL, 5, 300_000L);
     }
 
     @Test
